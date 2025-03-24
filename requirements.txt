@@ -13,3 +13,4 @@ typing-extensions
 aiohttp
 fastapi
 python-multipart
+ffmpeg
