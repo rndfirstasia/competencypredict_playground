@@ -970,120 +970,84 @@ def process_chunk(chunk_file, model, chunk_number, total_chunks, max_retries=3):
 
 #melakukan transkrip pada dengan gemini
 def transcribe_audio_gemini(audio_file, file_extension, id_input_id_kandidat):
-    temp_files = []  # Keep track of all temporary files
-    
     try:
-        # Prepare audio file
-        audio_file.seek(0)
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}")
-        temp_files.append(temp_file.name)
-        temp_file.write(audio_file.read())
-        temp_file.close()
-        
-        # Load audio
-        audio = AudioSegment.from_file(temp_file.name, format=file_extension)
-        
-        # Split into 5-minute chunks
-        chunk_length_ms = 300000  # 5 minutes
-        chunks = [audio[i:i+chunk_length_ms] for i in range(0, len(audio), chunk_length_ms)]
-        
-        st.write(f"Split audio into {len(chunks)} chunks of 5 minutes each")
-        
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        
-        # Dictionary to store results in order
-        chunk_results = {}
-        
-        # Process chunks concurrently
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(chunks), 4)) as executor:
-            future_to_chunk = {}
+        # Create temporary directory that will be automatically cleaned up
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Prepare audio file
+            audio_file.seek(0)
+            temp_file_path = os.path.join(temp_dir, f"input.{file_extension}")
+            with open(temp_file_path, 'wb') as temp_file:
+                temp_file.write(audio_file.read())
             
-            # Submit all chunks for processing
-            for i, chunk in enumerate(chunks):
-                chunk_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-                temp_files.append(chunk_file.name)
-                chunk.export(chunk_file.name, format="wav")
-                future = executor.submit(process_chunk, chunk_file, model, i+1, len(chunks))
-                future_to_chunk[future] = i
+            # Load audio using pydub
+            audio = AudioSegment.from_file(temp_file_path, format=file_extension)
             
-            # Collect results as they complete
-            for future in concurrent.futures.as_completed(future_to_chunk):
-                chunk_index = future_to_chunk[future]
-                try:
-                    chunk_result = future.result()
-                    if chunk_result:
-                        chunk_results[chunk_index] = chunk_result
-                        st.success(f"Chunk {chunk_index + 1}/{len(chunks)}: Successfully processed")
-                    else:
-                        st.warning(f"Chunk {chunk_index + 1}/{len(chunks)}: No valid transcription")
-                        # Try processing in smaller chunks if main chunk fails
-                        if len(chunks[chunk_index]) > 120000:  # If chunk is larger than 2 minutes
-                            st.write(f"Attempting to process chunk {chunk_index + 1} in smaller pieces...")
-                            smaller_chunk_length_ms = 120000  # 2 minutes
-                            smaller_chunks = [chunks[chunk_index][j:j+smaller_chunk_length_ms] 
-                                            for j in range(0, len(chunks[chunk_index]), smaller_chunk_length_ms)]
-                            
-                            smaller_results = []
-                            for j, small_chunk in enumerate(smaller_chunks):
-                                try:
-                                    small_chunk_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-                                    temp_files.append(small_chunk_file.name)
-                                    small_chunk.export(small_chunk_file.name, format="wav")
-                                    
-                                    small_result = process_chunk(small_chunk_file, model, 
-                                                               f"{chunk_index+1}.{j+1}", 
-                                                               f"{len(chunks)}.{len(smaller_chunks)}")
-                                    if small_result:
-                                        smaller_results.extend(small_result)
-                                except Exception as sub_e:
-                                    st.error(f"Error processing sub-chunk {j+1} of chunk {chunk_index + 1}: {sub_e}")
-                            
-                            if smaller_results:
-                                chunk_results[chunk_index] = smaller_results
-                            
-                except Exception as e:
-                    st.error(f"Error processing chunk {chunk_index + 1}: {e}")
-        
-        # Combine results in correct order
-        all_transcript_entries = []
-        for i in range(len(chunks)):
-            if i in chunk_results:
-                all_transcript_entries.extend(chunk_results[i])
-        
-        # Combine all transcript entries
-        final_result = {
-            "transkrip": all_transcript_entries
-        }
-        
-        st.write(f"Final combined transcript has {len(all_transcript_entries)} entries")
-        
-        # Validate and return final result
-        try:
-            transkrip_json = TranscriptResponse(**final_result)
-            return {
-                "registration_id": id_input_id_kandidat,
-                "transkrip": transkrip_json.model_dump()
+            # Split into 5-minute chunks (300000ms)
+            chunk_length_ms = 300000
+            chunks = [audio[i:i+chunk_length_ms] for i in range(0, len(audio), chunk_length_ms)]
+            
+            st.write(f"Split audio into {len(chunks)} chunks of 5 minutes each")
+            
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            chunk_results = {}
+            
+            # Process chunks concurrently with max 4 workers
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(chunks), 4)) as executor:
+                future_to_chunk = {}
+                
+                # Submit all chunks for processing
+                for i, chunk in enumerate(chunks):
+                    chunk_path = os.path.join(temp_dir, f"chunk_{i}.wav")
+                    chunk.export(chunk_path, format="wav")
+                    
+                    with open(chunk_path, "rb") as f:
+                        future = executor.submit(
+                            process_chunk,
+                            tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=temp_dir),
+                            model,
+                            i+1,
+                            len(chunks)
+                        )
+                        future_to_chunk[future] = i
+                
+                # Collect results as they complete
+                for future in concurrent.futures.as_completed(future_to_chunk):
+                    chunk_index = future_to_chunk[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            chunk_results[chunk_index] = result
+                            st.success(f"Chunk {chunk_index + 1}/{len(chunks)}: Successfully processed")
+                    except Exception as e:
+                        st.error(f"Error processing chunk {chunk_index + 1}: {e}")
+            
+            # Combine results in correct order
+            all_transcript_entries = []
+            for i in range(len(chunks)):
+                if i in chunk_results:
+                    all_transcript_entries.extend(chunk_results[i])
+            
+            final_result = {
+                "transkrip": all_transcript_entries
             }
-        except ValidationError as e:
-            st.error("Error: Final combined output doesn't match JSON Schema.")
-            st.write(e.json())
-            return None
+            
+            # Validate and return final result
+            try:
+                transkrip_json = TranscriptResponse(**final_result)
+                return {
+                    "registration_id": id_input_id_kandidat,
+                    "transkrip": transkrip_json.model_dump()
+                }
+            except ValidationError as e:
+                st.error("Error: Final combined output doesn't match JSON Schema.")
+                st.write(e.json())
+                return None
 
     except Exception as e:
         st.error(f"Error during Gemini API transcription: {e}")
         import traceback
         st.error(traceback.format_exc())
         return None
-        
-    finally:
-        # Clean up temporary files
-        for temp_file in temp_files:
-            try:
-                time.sleep(0.5)  # Brief pause to ensure file isn't in use
-                if os.path.exists(temp_file):
-                    os.unlink(temp_file)
-            except Exception as cleanup_error:
-                st.warning(f"Could not delete temporary file {temp_file}: {cleanup_error}")
     
 def insert_into_separator(id_transkrip, registration_id, revisi_transkrip, revisi_speaker, revisi_start_section, revisi_end_section):
     conn = create_db_connection()
